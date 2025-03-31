@@ -1,0 +1,771 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Raspberry Pi Ad-Hoc Ağı İçin Ağ Metrik Toplama Ajanı
+Bu modül, ağdaki metrik bilgilerini toplar ve merkezi koordinatöre (1. Raspberry Pi) iletir.
+"""
+
+import os
+import sys
+import time
+import paramiko
+import numpy as np
+import json
+import socket
+import subprocess
+import argparse
+import logging
+import threading
+import networkx as nx
+from datetime import datetime
+import csv
+
+# Loglama yapılandırması
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("network_agent.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("NetworkAgent")
+
+# Ağ topolojisi
+NETWORK_NODES = {
+    "192.168.1.101": {"username": "yasarpi1", "password": "yasarpi1"},
+    "192.168.1.102": {"username": "yasarpi2", "password": "yasarpi2"},
+    "192.168.1.103": {"username": "yasarpi3", "password": "yasarpi3"},
+    "192.168.1.104": {"username": "yasarpi4", "password": "yasarpi4"},
+    "192.168.1.105": {"username": "yasarpi5", "password": "yasarpi5"}
+}
+
+NETWORK_CONNECTIONS = [
+    ("192.168.1.101", "192.168.1.102"),
+    ("192.168.1.101", "192.168.1.103"),
+    ("192.168.1.102", "192.168.1.104"),
+    ("192.168.1.102", "192.168.1.105"),
+    ("192.168.1.103", "192.168.1.104"),
+    ("192.168.1.103", "192.168.1.105"),
+    ("192.168.1.104", "192.168.1.105")
+]
+
+SOURCE_NODE = "192.168.1.101"  # Koordinatör düğümü
+METRIC_UPDATE_INTERVAL = 10  # Metrik güncelleme aralığı (saniye)
+METRICS_FILE = "network_metrics.csv"
+
+
+class NetworkMonitor:
+    """
+    Ağ metriklerini izleme sınıfı
+    """
+    def __init__(self, nodes=NETWORK_NODES, connections=NETWORK_CONNECTIONS):
+        """
+        Ağ izleyicisini başlatır
+        
+        Args:
+            nodes (dict): Ağ düğümleri
+            connections (list): Ağ bağlantıları
+        """
+        self.nodes = nodes
+        self.connections = connections
+        self.metrics = {}
+        self.collected_metrics = {}  # Diğer düğümlerden toplanan metrikler
+        self.local_ip = self._get_local_ip()
+        self.running = False
+        
+        # Ağ grafiğini oluştur
+        self.graph = nx.Graph()
+        for node in self.nodes:
+            self.graph.add_node(node)
+        
+        for source, target in self.connections:
+            self.graph.add_edge(source, target)
+            self.graph.add_edge(target, source)  # Çift yönlü bağlantılar
+            
+        logger.info(f"NetworkMonitor başlatıldı. Yerel IP: {self.local_ip}")
+        logger.info(f"Topolojide {len(self.nodes)} düğüm ve {len(self.connections)} bağlantı bulunuyor")
+    
+    def _get_local_ip(self):
+        """
+        Yerel IP adresini tespit eder
+        
+        Returns:
+            str: Yerel IP adresi
+        """
+        try:
+            hostname = socket.gethostname()
+            ip_address = socket.gethostbyname(hostname)
+            
+            # Raspberry Pi ağında kullanılan IP adreslerini kontrol et
+            for node_ip in self.nodes.keys():
+                if node_ip == ip_address:
+                    return node_ip
+            
+            # IP adresi nodes listesinde bulunamazsa, SOURCE_NODE varsayılan olarak kullanılır
+            logger.warning(f"Yerel IP adresi ({ip_address}) ağ düğümleri listesinde bulunamadı. {SOURCE_NODE} kullanılıyor.")
+            return SOURCE_NODE
+            
+        except Exception as e:
+            logger.error(f"Yerel IP adresi alınırken hata: {e}")
+            return SOURCE_NODE
+    
+    def is_coordinator(self):
+        """
+        Bu düğümün koordinatör olup olmadığını kontrol eder
+        
+        Returns:
+            bool: Koordinatör ise True
+        """
+        return self.local_ip == SOURCE_NODE
+    
+    def measure_network_metrics(self, source, target):
+        """
+        İki düğüm arasındaki ağ metriklerini ölçer. 
+        Gerçek dosya transferi ve farklı boyutlu paketlerle ölçüm yapar.
+        
+        Args:
+            source (str): Kaynak düğüm IP'si
+            target (str): Hedef düğüm IP'si
+        
+        Returns:
+            dict: Ağ metrikleri
+        """
+        metrics = {
+            "delay_ms": 0,
+            "bandwidth_mbps": 0,
+            "packet_loss_percent": 0,
+            "cpu_usage_percent": 0,
+            "signal_strength_dbm": -65,  # Ortalama sinyal gücü
+            "ram_usage_percent": 50,     # Ortalama RAM kullanımı
+            "jitter_ms": 0,              # Ağ gecikmesindeki değişkenlik
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        try:
+            # 1. Gecikme ve paket kaybı ölçümü - değişken boyutlu paketler kullanarak
+            packet_sizes = [64, 512, 1024, 4096]  # Farklı paket boyutları (bayt)
+            delay_values = []
+            packet_loss_total = 0
+            
+            for size in packet_sizes:
+                cmd = f"ping -c 5 -s {size} {target}"
+                try:
+                    output = subprocess.check_output(cmd, shell=True, text=True)
+                    
+                    # Gecikme değerini çıkarma (ms cinsinden)
+                    for line in output.splitlines():
+                        if "avg" in line:
+                            parts = line.split("/")
+                            if len(parts) >= 5:
+                                delay = float(parts[4])
+                                delay_values.append(delay)
+                                break
+                    
+                    # Paket kaybı yüzdesini çıkarma
+                    for line in output.splitlines():
+                        if "packet loss" in line:
+                            parts = line.split(",")
+                            for part in parts:
+                                if "packet loss" in part:
+                                    loss = float(part.strip().split()[0].replace("%", ""))
+                                    packet_loss_total += loss
+                                    break
+                except subprocess.CalledProcessError:
+                    logger.warning(f"Ping ölçümü başarısız (paket boyutu: {size} bayt)")
+            
+            # Ortalama gecikme ve toplam paket kaybı
+            if delay_values:
+                metrics["delay_ms"] = sum(delay_values) / len(delay_values)
+                # Gecikme değişkenliği (jitter)
+                if len(delay_values) > 1:
+                    metrics["jitter_ms"] = max(delay_values) - min(delay_values)
+            
+            metrics["packet_loss_percent"] = packet_loss_total / len(packet_sizes) if packet_sizes else 0
+            
+            # 2. Bant genişliği ölçümü - her düğümde iperf3 çalıştığını varsayıyoruz
+            try:
+                # Daha uzun süreli ve çeşitli testler
+                cmd = f"iperf3 -c {target} -t 3 -J -P 3"  # 3 saniyelik test, 3 paralel akış
+                output = subprocess.check_output(cmd, shell=True, text=True)
+                iperf_data = json.loads(output)
+                metrics["bandwidth_mbps"] = iperf_data["end"]["sum_received"]["bits_per_second"] / 1000000
+            except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+                logger.warning(f"Bant genişliği ölçümü başarısız: {e}")
+                # Hata durumunda varsayılan değer
+                metrics["bandwidth_mbps"] = 10
+            
+            # 4. CPU ve RAM kullanımı ölçümü
+            # Bu, SSH ile hedef makinede çalıştırılmalıdır
+            username = self.nodes[target]["username"]
+            password = self.nodes[target]["password"]
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(target, username=username, password=password, timeout=5)
+            
+            # CPU kullanımı ölçümü
+            stdin, stdout, stderr = ssh.exec_command("top -bn1 | grep 'Cpu(s)'")
+            cpu_line = stdout.read().decode().strip()
+            
+            # CPU kullanımını çıkarma
+            if cpu_line:
+                parts = cpu_line.split()
+                for i, part in enumerate(parts):
+                    if "id," in part:
+                        # Boşta çalışma yüzdesini al ve kullanım yüzdesini hesapla
+                        idle = float(parts[i-1])
+                        metrics["cpu_usage_percent"] = 100.0 - idle
+                        break
+            
+            # RAM kullanımı ölçümü
+            stdin, stdout, stderr = ssh.exec_command("free | grep Mem")
+            mem_line = stdout.read().decode().strip()
+            
+            # RAM kullanımını çıkarma
+            if mem_line:
+                parts = mem_line.split()
+                if len(parts) >= 3:
+                    total = float(parts[1])
+                    used = float(parts[2])
+                    metrics["ram_usage_percent"] = (used / total) * 100 if total > 0 else 0
+            
+            # 5. Sinyal gücü ölçümü
+            try:
+                # İşletim sistemine bağlı olarak değişebilir
+                stdin, stdout, stderr = ssh.exec_command("iwconfig wlan0 | grep 'Signal level'")
+                output = stdout.read().decode().strip()
+                
+                # Sinyal gücünü çıkarma
+                for line in output.splitlines():
+                    if "Signal level" in line:
+                        parts = line.split("Signal level=")
+                        if len(parts) >= 2:
+                            signal_parts = parts[1].split()
+                            if len(signal_parts) >= 1:
+                                metrics["signal_strength_dbm"] = float(signal_parts[0].replace("dBm", ""))
+                                break
+            except:
+                logger.warning("Sinyal gücü ölçümü başarısız")
+            
+            ssh.close()
+            
+        except Exception as e:
+            logger.error(f"Ağ metriklerini ölçerken hata: {e}")
+            # Hata durumunda varsayılan değerler kullan
+            metrics = {
+                "delay_ms": 100,  # Orta seviye gecikme
+                "bandwidth_mbps": 10,  # Orta seviye bant genişliği
+                "packet_loss_percent": 1,  # Düşük paket kaybı
+                "cpu_usage_percent": 50,  # Orta seviye CPU kullanımı
+                "signal_strength_dbm": -65,  # Orta seviye sinyal gücü
+                "ram_usage_percent": 50,  # Orta seviye RAM kullanımı
+                "jitter_ms": 5,  # 5 ms gecikme değişkenliği
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        # Metrikleri kaydet
+        connection_key = f"{source}-{target}"
+        self.metrics[connection_key] = metrics
+        
+        return metrics
+    
+    def collect_metrics_from_node(self, node_ip):
+        """
+        Belirli bir düğümden komşularıyla ilgili ağ metriklerini toplar
+        
+        Args:
+            node_ip (str): Metrik toplanacak düğüm IP'si
+            
+        Returns:
+            dict: Toplanmış metrikler
+        """
+        node_metrics = {}
+        
+        try:
+            if node_ip == self.local_ip:
+                # Yerel düğüm için direkt ölçüm yap
+                neighbors = list(self.graph.neighbors(node_ip))
+                for neighbor in neighbors:
+                    metrics = self.measure_network_metrics(node_ip, neighbor)
+                    node_metrics[f"{node_ip}-{neighbor}"] = metrics
+                return node_metrics
+            
+            # Uzak düğüme SSH ile bağlan
+            username = self.nodes[node_ip]["username"]
+            password = self.nodes[node_ip]["password"]
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(node_ip, username=username, password=password, timeout=10)
+            
+            # Uzak düğümde metrik ölçüm komutunu çalıştır
+            # Uzak düğümün ip_forwarding etkin mi kontrol et
+            stdin, stdout, stderr = ssh.exec_command("cat /proc/sys/net/ipv4/ip_forward")
+            ip_forward = stdout.read().decode().strip()
+            if ip_forward != "1":
+                logger.warning(f"{node_ip} düğümünde ip_forwarding etkin değil")
+            
+            # Uzak düğümün iptables kurallarını kontrol et
+            stdin, stdout, stderr = ssh.exec_command("sudo iptables -L | grep FORWARD")
+            iptables = stdout.read().decode().strip()
+            if "DROP" in iptables:
+                logger.warning(f"{node_ip} düğümünde FORWARD DROP kuralı var")
+            
+            # Bu düğümün python scriptini çalıştır
+            command = (
+                "python3 -c \""
+                "import subprocess, json, datetime; "
+                "metrics = {}; "
+                f"neighbors = {list(self.graph.neighbors(node_ip))}; "
+                "for neighbor in neighbors: "
+                "    delay = 0; bandwidth = 10; packet_loss = 0; cpu = 50; signal = -65; ram = 50; "
+                "    try: "
+                "        cmd = f'ping -c 5 {neighbor}'; "
+                "        output = subprocess.check_output(cmd, shell=True, text=True); "
+                "        for line in output.splitlines(): "
+                "            if 'avg' in line: "
+                "                parts = line.split('/'); "
+                "                if len(parts) >= 5: delay = float(parts[4]); break; "
+                "        cmd = f'ping -c 10 {neighbor}'; "
+                "        output = subprocess.check_output(cmd, shell=True, text=True); "
+                "        for line in output.splitlines(): "
+                "            if 'packet loss' in line: "
+                "                parts = line.split(','); "
+                "                for part in parts: "
+                "                    if 'packet loss' in part: "
+                "                        packet_loss = float(part.strip().split()[0].replace('%', '')); break; "
+                "        # CPU kullanımı "
+                "        cmd = 'top -bn1 | grep \\'Cpu\\''; "
+                "        output = subprocess.check_output(cmd, shell=True, text=True); "
+                "        if output: "
+                "            parts = output.split(); "
+                "            for i, part in enumerate(parts): "
+                "                if 'id,' in part: "
+                "                    idle = float(parts[i-1]); "
+                "                    cpu = 100.0 - idle; break; "
+                "        # RAM kullanımı "
+                "        cmd = 'free | grep Mem'; "
+                "        output = subprocess.check_output(cmd, shell=True, text=True); "
+                "        if output: "
+                "            parts = output.split(); "
+                "            if len(parts) >= 3: "
+                "                total = float(parts[1]); "
+                "                used = float(parts[2]); "
+                "                ram = (used / total) * 100 if total > 0 else 0; "
+                "        # Sinyal gücü "
+                "        try: "
+                "            cmd = 'iwconfig wlan0 | grep \\'Signal level\\''; "
+                "            output = subprocess.check_output(cmd, shell=True, text=True); "
+                "            for line in output.splitlines(): "
+                "                if 'Signal level' in line: "
+                "                    parts = line.split('Signal level='); "
+                "                    if len(parts) >= 2: "
+                "                        signal_parts = parts[1].split(); "
+                "                        if len(signal_parts) >= 1: "
+                "                            signal = float(signal_parts[0].replace('dBm', '')); break; "
+                "        except: pass; "
+                "        # Bant genişliği "
+                "        try: "
+                "            cmd = f'iperf3 -c {neighbor} -t 1 -J'; "
+                "            output = subprocess.check_output(cmd, shell=True, text=True); "
+                "            iperf_data = json.loads(output); "
+                "            bandwidth = iperf_data['end']['sum_received']['bits_per_second'] / 1000000; "
+                "        except: pass; "
+                "    except Exception as e: "
+                "        print(f'Hata: {e}'); "
+                f"    metrics['{node_ip}-' + neighbor] = {{'delay_ms': delay, 'bandwidth_mbps': bandwidth, 'packet_loss_percent': packet_loss, 'cpu_usage_percent': cpu, 'signal_strength_dbm': signal, 'ram_usage_percent': ram, 'timestamp': datetime.datetime.now().isoformat()}}; "
+                "print(json.dumps(metrics));\""
+            )
+            
+            stdin, stdout, stderr = ssh.exec_command(command)
+            output = stdout.read().decode().strip()
+            error = stderr.read().decode().strip()
+            
+            if error:
+                logger.warning(f"Uzak düğümden metrik toplama uyarıları: {error}")
+            
+            if output:
+                try:
+                    node_metrics = json.loads(output)
+                    logger.info(f"{node_ip} düğümünden {len(node_metrics)} metrik toplandı")
+                except json.JSONDecodeError:
+                    logger.error(f"Geçersiz JSON yanıtı: {output}")
+            else:
+                logger.warning(f"{node_ip} düğümünden metrik toplanamadı")
+            
+            ssh.close()
+            
+        except Exception as e:
+            logger.error(f"{node_ip} düğümünden metrik toplarken hata: {e}")
+        
+        return node_metrics
+    
+    def update_all_metrics_distributed(self):
+        """
+        Dağıtık bir şekilde tüm düğümlerden ağ metriklerini toplar
+        """
+        all_metrics = {}
+        
+        if self.is_coordinator():
+            # Bu düğüm koordinatör (1. Raspberry Pi) ise tüm düğümlerden metrik topla
+            for node_ip in self.nodes:
+                logger.info(f"{node_ip} düğümünden metrikler toplanıyor...")
+                node_metrics = self.collect_metrics_from_node(node_ip)
+                all_metrics.update(node_metrics)
+            
+            # Toplanan tüm metrikleri merkezi metrik sözlüğüne aktar
+            self.metrics.update(all_metrics)
+            self.collected_metrics = all_metrics
+            logger.info(f"Toplam {len(all_metrics)} metrik toplandı ve güncellendi")
+            
+            # Metrikleri dosyaya kaydet
+            self.save_metrics_to_file()
+        else:
+            # Bu düğüm koordinatör değilse, kendi metriklerini ölç ve koordinatöre gönder
+            neighbors = list(self.graph.neighbors(self.local_ip))
+            for neighbor in neighbors:
+                metrics = self.measure_network_metrics(self.local_ip, neighbor)
+                connection_key = f"{self.local_ip}-{neighbor}"
+                all_metrics[connection_key] = metrics
+            
+            logger.info(f"Yerel olarak {len(all_metrics)} metrik ölçüldü")
+            
+            # Koordinatöre metrik gönderme
+            self.send_metrics_to_coordinator(all_metrics)
+    
+    def save_metrics_to_file(self):
+        """
+        Toplanan metrikleri CSV dosyasına kaydeder.
+        Eski metrikler korunarak zaman serisi verisi oluşturulur.
+        """
+        try:
+            # Yeni kayıt için zaman damgası
+            timestamp = datetime.now().isoformat()
+            
+            # CSV dosyasının var olup olmadığını kontrol et
+            file_exists = os.path.exists(METRICS_FILE)
+            
+            # CSV dosyasını açma modu: Dosya yoksa oluştur, varsa sonuna ekle
+            with open(METRICS_FILE, mode='a', newline='') as csv_file:
+                # CSV başlıklarını tanımla
+                fieldnames = ['timestamp', 'source', 'target', 'delay_ms', 'jitter_ms', 
+                              'packet_loss_percent', 'bandwidth_mbps', 'cpu_usage_percent', 
+                              'signal_strength_dbm', 'ram_usage_percent']
+                
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                
+                # Dosya yeni oluşturuluyorsa başlık satırını yaz
+                if not file_exists:
+                    writer.writeheader()
+                
+                # Tüm bağlantılar için metrikleri satır satır yaz
+                rows_written = 0
+                for connection, metrics in self.metrics.items():
+                    # Bağlantı stringini kaynak ve hedef olarak ayır
+                    source, target = connection.split('-')
+                    
+                    row = {
+                        'timestamp': timestamp,
+                        'source': source,
+                        'target': target,
+                        'delay_ms': metrics.get('delay_ms', 0),
+                        'jitter_ms': metrics.get('jitter_ms', 0),
+                        'packet_loss_percent': metrics.get('packet_loss_percent', 0),
+                        'bandwidth_mbps': metrics.get('bandwidth_mbps', 0),
+                        'cpu_usage_percent': metrics.get('cpu_usage_percent', 0),
+                        'signal_strength_dbm': metrics.get('signal_strength_dbm', -65),
+                        'ram_usage_percent': metrics.get('ram_usage_percent', 50)
+                    }
+                    writer.writerow(row)
+                    rows_written += 1
+                
+                logger.info(f"Metrikler '{METRICS_FILE}' dosyasına kaydedildi ({rows_written} satır)")
+            
+            # Dosya boyutunu kontrol et ve gerekirse arşivle
+            self.check_and_archive_csv()
+            
+        except Exception as e:
+            logger.error(f"Metrik kaydetme hatası: {e}")
+
+    def check_and_archive_csv(self):
+        """
+        CSV dosyasının boyutunu kontrol eder ve gerekirse arşivler
+        """
+        try:
+            # Dosya boyutunu MB cinsinden kontrol et (30 MB üstünde arşivle)
+            file_size_mb = os.path.getsize(METRICS_FILE) / (1024 * 1024)
+            max_size_mb = 30  # Maksimum 30 MB
+            
+            if file_size_mb > max_size_mb:
+                self.archive_metrics(METRICS_FILE)
+        except Exception as e:
+            logger.error(f"Dosya boyutu kontrolü sırasında hata: {e}")
+
+    def archive_metrics(self, metrics_file):
+        """
+        Metrik CSV dosyasını arşivler ve yeni bir dosya başlatır
+        """
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = os.path.splitext(metrics_file)[0]
+            archive_file = f"{base_name}_{timestamp}.csv"
+            
+            # Dosyayı kopyala
+            import shutil
+            shutil.copy(metrics_file, archive_file)
+            
+            # Yeni boş CSV dosyası oluştur (sadece başlıkları içeren)
+            with open(metrics_file, mode='w', newline='') as csv_file:
+                fieldnames = ['timestamp', 'source', 'target', 'delay_ms', 'jitter_ms', 
+                             'packet_loss_percent', 'bandwidth_mbps', 'cpu_usage_percent', 
+                             'signal_strength_dbm', 'ram_usage_percent']
+                
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+            
+            logger.info(f"Metrik dosyası arşivlendi: {archive_file}, yeni boş dosya oluşturuldu")
+        except Exception as e:
+            logger.error(f"Metrik arşivleme hatası: {e}")
+    
+    def send_metrics_to_coordinator(self, metrics):
+        """
+        Toplanan metrikleri koordinatör düğüme gönderir ve CSV olarak kaydettirir
+        
+        Args:
+            metrics (dict): Gönderilecek metrikler
+        """
+        if self.is_coordinator():
+            # Zaten koordinatör olduğumuz için göndermeye gerek yok
+            return
+        
+        try:
+            # Koordinatöre SSH ile bağlan
+            username = self.nodes[SOURCE_NODE]["username"]
+            password = self.nodes[SOURCE_NODE]["password"]
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(SOURCE_NODE, username=username, password=password, timeout=10)
+            
+            # Şu anki zaman
+            timestamp = datetime.now().isoformat()
+            
+            # CSV formatında metrikler için Python kodu
+            metrics_json = json.dumps(metrics)  # Önce JSON olarak gönder, alıcı tarafta CSV'ye çevrilecek
+            command = (
+                f"python3 -c \""
+                f"import json, csv, os, datetime; "
+                f"metrics_file = '{METRICS_FILE}'; "
+                f"metrics_data = json.loads('{metrics_json}'); "
+                f"timestamp = '{timestamp}'; "
+                f"file_exists = os.path.exists(metrics_file); "
+                f"with open(metrics_file, mode='a', newline='') as csv_file: "
+                f"    fieldnames = ['timestamp', 'source', 'target', 'delay_ms', 'jitter_ms', 'packet_loss_percent', 'bandwidth_mbps', 'cpu_usage_percent', 'signal_strength_dbm', 'ram_usage_percent']; "
+                f"    writer = csv.DictWriter(csv_file, fieldnames=fieldnames); "
+                f"    if not file_exists: writer.writeheader(); "
+                f"    rows_written = 0; "
+                f"    for connection, metrics in metrics_data.items(): "
+                f"        source, target = connection.split('-'); "
+                f"        row = {{'timestamp': timestamp, 'source': source, 'target': target, 'delay_ms': metrics.get('delay_ms', 0), 'jitter_ms': metrics.get('jitter_ms', 0), 'packet_loss_percent': metrics.get('packet_loss_percent', 0), 'bandwidth_mbps': metrics.get('bandwidth_mbps', 0), 'cpu_usage_percent': metrics.get('cpu_usage_percent', 0), 'signal_strength_dbm': metrics.get('signal_strength_dbm', -65), 'ram_usage_percent': metrics.get('ram_usage_percent', 50)}}; "
+                f"        writer.writerow(row); "
+                f"        rows_written += 1; "
+                f"    print(f'Metrikler CSV dosyasına kaydedildi ({{rows_written}} satır)');\""
+            )
+            
+            stdin, stdout, stderr = ssh.exec_command(command)
+            output = stdout.read().decode().strip()
+            error = stderr.read().decode().strip()
+            
+            if error:
+                logger.warning(f"Koordinatöre CSV metrik gönderirken uyarı: {error}")
+            
+            if output:
+                logger.info(f"Koordinatör yanıtı: {output}")
+            
+            ssh.close()
+            
+        except Exception as e:
+            logger.error(f"Koordinatöre CSV metrik gönderirken hata: {e}")
+    
+    def update_all_metrics(self):
+        """
+        Tüm bağlantılar için ağ metriklerini günceller
+        """
+        # Yeni dağıtık metrik toplama sistemini kullan
+        self.update_all_metrics_distributed()
+    
+    def start_monitoring(self, interval=METRIC_UPDATE_INTERVAL):
+        """
+        Düzenli aralıklarla ağ metriklerini toplamaya başlar
+        
+        Args:
+            interval (int): Güncelleme aralığı (saniye)
+        """
+        self.running = True
+        
+        def monitor_loop():
+            while self.running:
+                try:
+                    logger.info(f"Ağ metrikleri güncelleniyor... (her {interval} saniyede bir)")
+                    self.update_all_metrics()
+                    time.sleep(interval)
+                except Exception as e:
+                    logger.error(f"Metrik toplama döngüsünde hata: {e}")
+                    time.sleep(5)  # Hata durumunda 5 saniye bekle
+        
+        self.monitor_thread = threading.Thread(target=monitor_loop)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        
+        logger.info(f"Ağ izleme başlatıldı (interval: {interval}s)")
+    
+    def stop_monitoring(self):
+        """
+        Ağ metriklerini toplamayı durdurur
+        """
+        self.running = False
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread.join(timeout=2)
+        logger.info("Ağ izleme durduruldu")
+
+    def merge_csv_files(self, output_file="merged_metrics.csv", directory="."):
+        """
+        Belirtilen dizindeki tüm ağ metrik CSV dosyalarını tek bir dosyada birleştirir
+        
+        Args:
+            output_file (str): Çıktı dosyasının adı
+            directory (str): CSV dosyalarının bulunduğu dizin
+        
+        Returns:
+            int: Birleştirilen toplam satır sayısı
+        """
+        try:
+            import glob
+            
+            # Hedef dizindeki tüm CSV dosyalarını bul (network_metrics*.csv)
+            base_name = os.path.splitext(os.path.basename(METRICS_FILE))[0]
+            pattern = os.path.join(directory, f"{base_name}*.csv")
+            csv_files = glob.glob(pattern)
+            
+            if not csv_files:
+                logger.warning(f"Birleştirilecek CSV dosyası bulunamadı: {pattern}")
+                return 0
+            
+            # CSV dosyalarını oluşturulma zamanlarına göre sırala
+            csv_files.sort(key=lambda x: os.path.getmtime(x))
+            
+            # Çıktı dosyası
+            with open(output_file, 'w', newline='') as outfile:
+                # İlk dosyadan başlıkları al
+                with open(csv_files[0], 'r', newline='') as infile:
+                    reader = csv.reader(infile)
+                    headers = next(reader)  # İlk satır (başlıklar)
+                    
+                    # Çıktı dosyasına başlıkları yaz
+                    writer = csv.writer(outfile)
+                    writer.writerow(headers)
+                    
+                    # İlk dosyanın verilerini ekle
+                    for row in reader:
+                        writer.writerow(row)
+                
+                # Diğer dosyaları birleştir (başlık satırını atla)
+                total_rows = 0
+                for file in csv_files[1:]:
+                    with open(file, 'r', newline='') as infile:
+                        reader = csv.reader(infile)
+                        next(reader)  # Başlık satırını atla
+                        
+                        # Her satırı ekle
+                        for row in reader:
+                            writer.writerow(row)
+                            total_rows += 1
+                    
+                    logger.info(f"Dosya birleştirildi: {file}")
+                
+                logger.info(f"Tüm CSV dosyaları başarıyla birleştirildi: {output_file} (toplam {total_rows} satır)")
+                return total_rows
+                
+        except Exception as e:
+            logger.error(f"CSV dosyaları birleştirilirken hata: {e}")
+            return 0
+
+
+def main():
+    """
+    Ana fonksiyon - Ağ metrik toplama ajanını başlatır
+    """
+    parser = argparse.ArgumentParser(description="Raspberry Pi Ad-Hoc Ağı İçin Ağ Metrik Toplama Ajanı")
+    parser.add_argument("--interval", type=int, default=METRIC_UPDATE_INTERVAL, 
+                        help=f"Metrik güncelleme aralığı (saniye, varsayılan: {METRIC_UPDATE_INTERVAL})")
+    parser.add_argument("--collect-once", action="store_true", 
+                        help="Metrikleri bir kez topla ve çık")
+    parser.add_argument("--save-file", type=str, default=METRICS_FILE,
+                        help=f"Metrik kayıt dosyası (varsayılan: {METRICS_FILE})")
+    parser.add_argument("--format", choices=["csv", "json"], default="csv",
+                        help=f"Metrik dosyası formatı (varsayılan: csv)")
+    parser.add_argument("--merge-csv", action="store_true",
+                        help="Tüm CSV dosyalarını birleştir")
+    parser.add_argument("--merge-output", type=str, default="merged_metrics.csv",
+                        help="Birleştirilmiş CSV dosyasının adı")
+    parser.add_argument("--dir", type=str, default=".",
+                        help="İşlem yapılacak dizin (varsayılan: geçerli dizin)")
+    
+    args = parser.parse_args()
+    
+    # Metrik dosyasını güncelle
+    global METRICS_FILE
+    METRICS_FILE = args.save_file
+    
+    # Format kontrolü
+    if args.format == "json" and not METRICS_FILE.endswith(".json"):
+        METRICS_FILE = os.path.splitext(METRICS_FILE)[0] + ".json"
+        logger.info(f"JSON formatı seçildi, dosya adı: {METRICS_FILE}")
+    elif args.format == "csv" and not METRICS_FILE.endswith(".csv"):
+        METRICS_FILE = os.path.splitext(METRICS_FILE)[0] + ".csv"
+        logger.info(f"CSV formatı seçildi, dosya adı: {METRICS_FILE}")
+    
+    # CSV dosyalarını birleştirme modu
+    if args.merge_csv:
+        monitor = NetworkMonitor()
+        monitor.merge_csv_files(output_file=args.merge_output, directory=args.dir)
+        return
+        
+    # Ağ izleyicisini oluştur
+    monitor = NetworkMonitor()
+    
+    # Yerel IP ve koordinatör bilgisini göster
+    local_ip = monitor.local_ip
+    is_coordinator = monitor.is_coordinator()
+    
+    logger.info(f"Ağ metrik toplama ajanı başlatılıyor...")
+    logger.info(f"Yerel IP: {local_ip}")
+    logger.info(f"Koordinatör mü: {'Evet' if is_coordinator else 'Hayır'}")
+    
+    if args.collect_once:
+        # Metrikleri bir kez topla
+        logger.info("Metrikler bir kez toplanıyor...")
+        monitor.update_all_metrics()
+        logger.info("Metrik toplama tamamlandı")
+    else:
+        # Düzenli aralıklarla toplamaya başla
+        try:
+            monitor.start_monitoring(interval=args.interval)
+            
+            # Programın çalışmaya devam etmesi için ana thread'i blokla
+            logger.info("Metrik toplama ajanı çalışıyor. Durdurmak için Ctrl+C'ye basın.")
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Klavye kesintisi algılandı. Ajan durduruluyor...")
+            monitor.stop_monitoring()
+            logger.info("Ajan durduruldu.")
+        except Exception as e:
+            logger.error(f"Beklenmeyen hata: {e}")
+            monitor.stop_monitoring()
+
+
+if __name__ == "__main__":
+    main() 
